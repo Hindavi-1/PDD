@@ -1,5 +1,6 @@
 # flask_app.py
 
+import os
 from flask import Flask, request, jsonify
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
@@ -91,7 +92,10 @@ def predict():
     
     except Exception as e:
         return jsonify({'error': f'Error processing image: {str(e)}'}), 500
+    
+    
+port = int(os.environ.get('PORT', 5000))
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True)
