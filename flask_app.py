@@ -100,7 +100,6 @@
 # if __name__ == '__main__':
 #     app.run(host='0.0.0.0', port=port, debug=True)
 
-
 import os
 import io
 import numpy as np
@@ -109,14 +108,17 @@ from flask_cors import CORS
 from tensorflow.keras.preprocessing import image
 from PIL import Image
 
-# Initialize Flask app
+# --- Make TF faster/more predictable on small CPU instances ---
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+# If you see odd slowdowns, try disabling oneDNN:
+# os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
 app = Flask(__name__)
-CORS(app)  # Allow cross-origin requests
+CORS(app)
 
-# Lazy-loaded model
-model = None
-
-# Class names corresponding to the model's output
+# --------- Labels ----------
 class_names = [
     'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
     'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
@@ -133,88 +135,93 @@ class_names = [
     'Tomato___healthy'
 ]
 
-# Optional: Add disease-specific suggestions
 disease_info = {
-    'Apple___Apple_scab': {
-        'suggestion': 'Use fungicides and remove infected leaves.',
-        'severity': 'medium'
-    },
-    'Apple___Black_rot': {
-        'suggestion': 'Prune infected branches and use copper sprays.',
-        'severity': 'high'
-    },
-    'Corn_(maize)___Common_rust_': {
-        'suggestion': 'Apply resistant hybrid seeds and fungicide if severe.',
-        'severity': 'medium'
-    },
-    'Tomato___Late_blight': {
-        'suggestion': 'Remove infected leaves and apply appropriate fungicides.',
-        'severity': 'high'
-    },
+    'Apple___Apple_scab': {'suggestion': 'Use fungicides and remove infected leaves.','severity': 'medium'},
+    'Apple___Black_rot': {'suggestion': 'Prune infected branches and use copper sprays.','severity': 'high'},
+    'Corn_(maize)___Common_rust_': {'suggestion': 'Apply resistant hybrid seeds and fungicide if severe.','severity': 'medium'},
+    'Tomato___Late_blight': {'suggestion': 'Remove infected leaves and apply appropriate fungicides.','severity': 'high'},
 }
 
+# --------- Model handling ----------
+model = None
+MODEL_PATH = "trained_model.h5"
 
 def get_model():
-    """Load the model lazily to reduce cold start time."""
+    """Lazy load (used as fallback if preload fails)."""
     global model
     if model is None:
         from tensorflow.keras.models import load_model
-        model_path = 'trained_model.h5'
-        print(f"🔍 Checking model file at: {os.path.abspath(model_path)}")
-        print("📂 Current directory contents:", os.listdir())
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file '{model_path}' not found in container!")
+        print(f"🔍 Looking for model at: {os.path.abspath(MODEL_PATH)}")
+        print("📂 CWD contents:", os.listdir())
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(f"Model file '{MODEL_PATH}' not found.")
         print("⏳ Loading model...")
-        model = load_model(model_path)
-        print("✅ Model loaded successfully!")
+        model = load_model(MODEL_PATH)
+        print("✅ Model loaded (lazy).")
     return model
 
+def warmup():
+    """Preload and run one dummy prediction so first real request is fast."""
+    try:
+        mdl = get_model()
+        dummy = np.zeros((1, 128, 128, 3), dtype=np.float32)
+        _ = mdl.predict(dummy)
+        print("🔥 Warmup inference completed.")
+    except Exception as e:
+        # Don't crash app on warmup failure; prediction path can still lazy-load.
+        print(f"⚠️ Warmup failed: {e}")
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Railway warm-up."""
+# Preload/warmup at import time so Gunicorn --preload can do it before the first request
+if os.environ.get("PRELOAD_MODEL", "1") == "1":
+    warmup()
+
+# --------- Routes ----------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "message": "Plant Disease API is running"}), 200
+
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({"status": "ok"}), 200
 
-
-@app.route('/predict', methods=['POST'])
+@app.route("/predict", methods=["POST"])
 def predict():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
     file = request.files['file']
-
     try:
-        # Load and preprocess the image
-        img = Image.open(io.BytesIO(file.read())).convert('RGB')
+        # Read & preprocess image safely
+        raw = file.read()
+        if not raw:
+            return jsonify({'error': 'Empty file'}), 400
+
+        img = Image.open(io.BytesIO(raw)).convert('RGB')
         img = img.resize((128, 128))
         img_arr = image.img_to_array(img)
-        img_arr = np.expand_dims(img_arr, axis=0)
+        img_arr = np.expand_dims(img_arr, axis=0).astype(np.float32)
+        # If your model expects normalization, uncomment the next line:
+        # img_arr = img_arr / 255.0
 
-        # Make prediction
         mdl = get_model()
-        prediction = mdl.predict(img_arr)
-        result_index = np.argmax(prediction)
-        label = class_names[result_index]
-        confidence = float(np.max(prediction))
+        preds = mdl.predict(img_arr)
+        idx = int(np.argmax(preds))
+        label = class_names[idx]
+        confidence = float(np.max(preds))
 
-        # Get additional info
-        info = disease_info.get(label, {
-            'suggestion': 'No specific suggestion available.',
-            'severity': 'unknown'
-        })
+        info = disease_info.get(label, {'suggestion': 'No specific suggestion available.','severity': 'unknown'})
 
         return jsonify({
-            'prediction_index': int(result_index),
+            'prediction_index': idx,
             'label': label,
             'confidence': confidence,
             'suggestion': info['suggestion'],
             'severity': info['severity']
-        })
+        }), 200
 
     except Exception as e:
         return jsonify({'error': f'Error processing image: {str(e)}'}), 500
 
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
